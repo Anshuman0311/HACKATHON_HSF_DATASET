@@ -1,0 +1,355 @@
+import os
+import numpy as np
+import pandas as pd
+import h5py
+from sklearn.preprocessing import StandardScaler, KBinsDiscretizer
+from sklearn.metrics import roc_auc_score
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier, early_stopping
+from sklearn.ensemble import RandomForestClassifier
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, BatchNormalization
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras import mixed_precision
+import warnings
+warnings.filterwarnings('ignore')
+
+# -------------------- PATHS --------------------
+train_labels_path = r"C:\Users\LOQ\Desktop\HACKATHON_HSF\data\train\labels\labels.npy"
+train_images_path = r"C:\Users\LOQ\Desktop\HACKATHON_HSF\data\train\images\jet_images.h5"
+train_features_path = r"C:\Users\LOQ\Desktop\HACKATHON_HSF\data\train\features\cluster_features.csv"
+train_ids_path = r"C:\Users\LOQ\Desktop\HACKATHON_HSF\data\train\ids\ids.npy"
+
+val_labels_path = r"C:\Users\LOQ\Desktop\HACKATHON_HSF\data\val\labels\labels.npy"
+val_images_path = r"C:\Users\LOQ\Desktop\HACKATHON_HSF\data\val\images\jet_images.h5"
+val_features_path = r"C:\Users\LOQ\Desktop\HACKATHON_HSF\data\val\features\cluster_features.csv"
+val_ids_path = r"C:\Users\LOQ\Desktop\HACKATHON_HSF\data\val\ids\ids.npy"
+
+test_images_path = r"C:\Users\LOQ\Desktop\HACKATHON_HSF\data\test\images\jet_images.h5"
+test_features_path = r"C:\Users\LOQ\Desktop\HACKATHON_HSF\data\test\features\cluster_features.csv"
+test_ids_path = r"C:\Users\LOQ\Desktop\HACKATHON_HSF\data\test\ids\ids.npy"
+
+submission_csv_path = r"C:\Users\LOQ\Desktop\HACKATHON_HSF\submission.csv"
+
+# -------------------- LOAD DATA --------------------
+def load_images(h5_path):
+    with h5py.File(h5_path, 'r') as f:
+        return np.array(f['images'])
+
+def load_labels(path):
+    return np.load(path)
+
+def load_ids(path):
+    return np.load(path)
+
+def load_features(path):
+    return pd.read_csv(path)
+
+print("Loading data with proper validation setup...")
+X_train_img = load_images(train_images_path)
+X_train_feat_df = load_features(train_features_path)
+y_train = load_labels(train_labels_path)
+
+X_val_img = load_images(val_images_path)
+X_val_feat_df = load_features(val_features_path)
+y_val = load_labels(val_labels_path)
+
+X_test_img = load_images(test_images_path)
+X_test_feat_df = load_features(test_features_path)
+test_ids = load_ids(test_ids_path)
+
+# -------------------- ADVANCED FEATURE ENGINEERING --------------------
+def add_physics_features(df):
+    df = df.copy()
+    df['max_cluster_pt_ratio'] = df['max_cluster_pt'] / (df['total_pt'] + 1e-10)
+    df['cluster_size_asymmetry'] = (df['max_cluster_size'] - df['mean_cluster_size']) / (df['max_cluster_size'] + df['mean_cluster_size'] + 1e-10)
+    df['energy_concentration'] = df['max_cluster_pt'] / (df['total_pt'] + 1e-10)
+    df['eta_spread'] = df['max_cluster_eta'] - df['mean_cluster_eta']
+    df['phi_spread'] = df['max_cluster_phi'] - df['mean_cluster_phi']
+    df['cluster_balance'] = df['cluster_pt_ratio'] * df['cluster_size_ratio']
+    df['pt_complexity'] = df['std_cluster_pt'] / (df['mean_cluster_pt'] + 1e-10)
+    df['size_complexity'] = df['std_cluster_size'] / (df['mean_cluster_size'] + 1e-10)
+    df['energy_compactness'] = df['max_cluster_pt'] * df['max_cluster_size'] / (df['total_pt'] + 1e-10)
+    df['spatial_constraint'] = df['mean_cluster_eta'] * df['mean_cluster_phi']
+    df['substructure_score'] = df['cluster_pt_ratio'] * df['n_clusters'] / (df['total_pt'] + 1e-10)
+    return df
+
+print("Engineering advanced features...")
+X_train_feat_df = add_physics_features(X_train_feat_df)
+X_val_feat_df   = add_physics_features(X_val_feat_df)
+X_test_feat_df  = add_physics_features(X_test_feat_df)
+
+# -------------------- ADDITIONAL FEATURE ENGINEERING --------------------
+print("Applying log-transform, interactions, and binnings on feature DataFrames...")
+train_df = X_train_feat_df.copy()
+val_df = X_val_feat_df.copy()
+test_df = X_test_feat_df.copy()
+
+num_cols = train_df.select_dtypes(include=[np.number]).columns.tolist()
+for c in num_cols:
+    if (train_df[c] > 0).all() and (val_df[c] >= 0).all() and (test_df[c] >= 0).all():
+        train_df[c] = np.log1p(train_df[c])
+        val_df[c] = np.log1p(val_df[c])
+        test_df[c] = np.log1p(test_df[c])
+
+top_k = 10
+corrs = train_df.corrwith(pd.Series(y_train)).abs().sort_values(ascending=False)
+top_feats = corrs.head(top_k).index.tolist()
+
+for i, f1 in enumerate(top_feats):
+    for f2 in top_feats[i+1:]:
+        colname = f"{f1}x{f2}"
+        train_df[colname] = train_df[f1] * train_df[f2]
+        val_df[colname]   = val_df[f1]   * val_df[f2]
+        test_df[colname]  = test_df[f1]  * test_df[f2]
+
+kbd = KBinsDiscretizer(n_bins=5, encode='onehot-dense', strategy='quantile')
+for feat in top_feats:
+    try:
+        train_bin = kbd.fit_transform(train_df[[feat]])
+        val_bin = kbd.transform(val_df[[feat]])
+        test_bin = kbd.transform(test_df[[feat]])
+    except Exception:
+        continue
+    for j in range(train_bin.shape[1]):
+        bname = f"{feat}bin{j}"
+        train_df[bname] = train_bin[:, j]
+        val_df[bname] = val_bin[:, j]
+        test_df[bname] = test_bin[:, j]
+
+X_train_feat_df = train_df
+X_val_feat_df = val_df
+X_test_feat_df = test_df
+
+X_train_feat = X_train_feat_df.values
+X_val_feat   = X_val_feat_df.values
+X_test_feat  = X_test_feat_df.values
+
+# -------------------- PREPROCESSING --------------------
+print("Preprocessing data (scaling, image normalization, combine)...")
+feat_scaler = StandardScaler()
+X_train_feat_scaled = feat_scaler.fit_transform(X_train_feat)
+X_val_feat_scaled   = feat_scaler.transform(X_val_feat)
+X_test_feat_scaled  = feat_scaler.transform(X_test_feat)
+
+X_train_img_norm = X_train_img / 255.0
+X_val_img_norm   = X_val_img / 255.0
+X_test_img_norm  = X_test_img / 255.0
+
+X_train_img_flat = X_train_img_norm.reshape(X_train_img_norm.shape[0], -1)
+X_val_img_flat   = X_val_img_norm.reshape(X_val_img_norm.shape[0], -1)
+X_test_img_flat  = X_test_img_norm.reshape(X_test_img_norm.shape[0], -1)
+
+img_scaler = StandardScaler()
+X_train_img_flat_scaled = img_scaler.fit_transform(X_train_img_flat)
+X_val_img_flat_scaled   = img_scaler.transform(X_val_img_flat)
+X_test_img_flat_scaled  = img_scaler.transform(X_test_img_flat)
+
+X_train_comb = np.hstack([X_train_img_flat_scaled, X_train_feat_scaled])
+X_val_comb   = np.hstack([X_val_img_flat_scaled, X_val_feat_scaled])
+X_test_comb  = np.hstack([X_test_img_flat_scaled, X_test_feat_scaled])
+
+comb_scaler = StandardScaler()
+X_train_final = comb_scaler.fit_transform(X_train_comb)
+X_val_final   = comb_scaler.transform(X_val_comb)
+X_test_final  = comb_scaler.transform(X_test_comb)
+
+# -------------------- MULTI-MODEL TRAINING --------------------
+models = {}
+val_predictions = {}
+val_scores = {}
+
+print("Training multiple models with GPU optimization...")
+import xgboost as xgb
+
+dtrain = xgb.DMatrix(X_train_final, label=y_train)
+dvalid = xgb.DMatrix(X_val_final, label=y_val)
+
+params = {
+    "objective": "binary:logistic",
+    "eval_metric": "auc",
+    "tree_method": "gpu_hist",
+    "predictor": "gpu_predictor"
+}
+
+watchlist = [(dtrain, "train"), (dvalid, "eval")]
+
+bst = xgb.train(
+    params,
+    dtrain,
+    num_boost_round=2000,
+    evals=watchlist,
+    early_stopping_rounds=50,
+    verbose_eval=100
+)
+
+# -------- XGBoost --------
+print("Training XGBoost...")
+xgb_model = XGBClassifier(
+    n_estimators=500,
+    max_depth=6,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    reg_alpha=1.0,
+    reg_lambda=1.0,
+    use_label_encoder=False,
+    eval_metric='auc',
+    random_state=42,
+    tree_method="gpu_hist",
+    predictor="gpu_predictor",
+    n_jobs=-1
+)
+
+xgb_model.fit(
+    X_train_final, y_train,
+    eval_set=[(X_val_final, y_val)],
+    verbose=100
+)
+models['xgb'] = xgb_model
+val_predictions['xgb'] = xgb_model.predict_proba(X_val_final)[:, 1]
+val_scores['xgb'] = roc_auc_score(y_val, val_predictions['xgb'])
+
+# -------- LightGBM --------
+print("Training LightGBM...")
+lgbm_model = LGBMClassifier(
+    n_estimators=500,
+    max_depth=6,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    reg_alpha=1.0,
+    reg_lambda=1.0,
+    random_state=42,
+    n_jobs=-1,
+    verbose=-1,
+    device="gpu",
+    gpu_platform_id=0,
+    gpu_device_id=0
+)
+
+lgbm_model.fit(
+    X_train_final, y_train,
+    eval_set=[(X_val_final, y_val)],
+    eval_metric='auc',
+    callbacks=[early_stopping(stopping_rounds=50)]
+)
+models['lgbm'] = lgbm_model
+val_predictions['lgbm'] = lgbm_model.predict_proba(X_val_final)[:, 1]
+val_scores['lgbm'] = roc_auc_score(y_val, val_predictions['lgbm'])
+
+# -------- Random Forest --------
+print("Training Random Forest...")
+rf_model = RandomForestClassifier(
+    n_estimators=500,
+    max_depth=15,
+    min_samples_leaf=2,
+    n_jobs=-1,
+    random_state=42
+)
+rf_model.fit(X_train_final, y_train)
+models['rf'] = rf_model
+val_predictions['rf'] = rf_model.predict_proba(X_val_final)[:, 1]
+val_scores['rf'] = roc_auc_score(y_val, val_predictions['rf'])
+
+# -------- DNN --------
+print("Training DNN...")
+try:
+    policy = mixed_precision.Policy('mixed_float16')
+    mixed_precision.set_global_policy(policy)
+    print("mixed precision enabled: mixed_float16")
+except Exception:
+    print("mixed precision not enabled (CPU/platform may not support)")
+
+dnn_model = Sequential([
+    Dense(128, activation='relu', input_shape=(X_train_final.shape[1],), kernel_regularizer=l2(0.005)),
+    Dropout(0.25),
+    BatchNormalization(),
+    Dense(64, activation='relu', kernel_regularizer=l2(0.005)),
+    Dropout(0.2),
+    BatchNormalization(),
+    Dense(32, activation='relu', kernel_regularizer=l2(0.005)),
+    Dropout(0.15),
+    Dense(1, activation='sigmoid', dtype='float32')
+])
+
+dnn_model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+early_stop = EarlyStopping(monitor='val_loss', patience=12, restore_best_weights=True)
+
+dnn_model.fit(
+    X_train_final, y_train,
+    validation_data=(X_val_final, y_val),
+    epochs=100,
+    batch_size=32,
+    callbacks=[early_stop],
+    verbose=1
+)
+
+models['dnn'] = dnn_model
+val_predictions['dnn'] = dnn_model.predict(X_val_final).flatten()
+val_scores['dnn'] = roc_auc_score(y_val, val_predictions['dnn'])
+
+# -------------------- VALIDATION SUMMARY --------------------
+print("\n=== MODEL VALIDATION RESULTS ===")
+overfitting_detected = False
+for model_name, score in val_scores.items():
+    print(f"{model_name.upper()} Validation AUC: {score:.6f}")
+    if score < 0.90:
+        overfitting_detected = True
+        print(f"WARNING: {model_name} may be underperforming (AUC < 0.90)")
+
+if overfitting_detected:
+    print("\nUsing conservative ensemble (drop models AUC < 0.90)...")
+    models_to_use = {k: v for k, v in models.items() if val_scores[k] >= 0.90}
+else:
+    print("\nAll models performing well — using full ensemble.")
+    models_to_use = models
+
+# -------------------- RETRAIN ON FULL DATA --------------------
+print("Retraining best models on full data...")
+X_full_final = np.vstack([X_train_final, X_val_final])
+y_full = np.concatenate([y_train, y_val])
+
+final_models = {}
+for model_name, model in models_to_use.items():
+    if model_name == 'xgb':
+        params = xgb_model.get_params()
+        final_model = XGBClassifier(**params)
+        final_model.fit(X_full_final, y_full)
+        final_models[model_name] = final_model
+    elif model_name == 'lgbm':
+        params = lgbm_model.get_params()
+        final_model = LGBMClassifier(**params)
+        final_model.fit(X_full_final, y_full)
+        final_models[model_name] = final_model
+    else:
+        final_models[model_name] = model
+
+# -------------------- ENSEMBLE PREDICTIONS --------------------
+print("Creating ensemble predictions on test set...")
+test_predictions = {}
+for model_name, model in final_models.items():
+    if model_name in ['xgb', 'lgbm', 'rf']:
+        test_predictions[model_name] = model.predict_proba(X_test_final)[:, 1]
+    else:
+        test_predictions[model_name] = model.predict(X_test_final).flatten()
+
+aucs = np.array([val_scores[m] for m in final_models.keys()])
+weights_array = aucs / aucs.sum()
+weights = dict(zip(final_models.keys(), weights_array))
+
+print("\n=== ENSEMBLE WEIGHTS ===")
+for m, w in weights.items():
+    print(f"{m.upper()}: {w:.3f} (AUC: {val_scores[m]:.6f})")
+
+final_test_pred = np.zeros(X_test_final.shape[0], dtype=float)
+for mname, pred in test_predictions.items():
+    final_test_pred += pred * weights[mname]
+
+# -------------------- SAVE SUBMISSION --------------------
+print("Creating submission file...")
+submission = pd.DataFrame({'id': test_ids, 'label': final_test_pred})
+submission.to_csv(submission_csv_path, index=False)
+print(f"✅ Submission saved to: {submission_csv_path}")
+print("🎯 Done, bitches")
